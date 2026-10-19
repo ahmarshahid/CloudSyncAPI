@@ -1,11 +1,8 @@
 from django.contrib import admin
-from django.contrib.auth import get_user_model
 from django.contrib.auth.admin import UserAdmin as BaseUserAdmin
+from django.contrib.auth.models import User
 
-from .forms import UserAdminChangeForm, UserAdminCreationForm
 from .models import Invitation, Profile
-
-User = get_user_model()
 
 
 class ProfileInline(admin.StackedInline):
@@ -13,31 +10,10 @@ class ProfileInline(admin.StackedInline):
     can_delete = False
 
 
-@admin.register(User)
 class UserAdmin(BaseUserAdmin):
-    form = UserAdminChangeForm
-    add_form = UserAdminCreationForm
     inlines = [ProfileInline]
-
-    ordering = ('email',)
-    list_display = ('email', 'username', 'first_name', 'last_name', 'is_staff', 'user_type')
+    list_display = BaseUserAdmin.list_display + ('user_type',)
     list_filter = BaseUserAdmin.list_filter + ('profile__user_type',)
-    search_fields = ('email', 'username', 'first_name', 'last_name')
-
-    fieldsets = (
-        (None, {'fields': ('email', 'password')}),
-        ('Personal info', {'fields': ('username', 'first_name', 'last_name')}),
-        ('Permissions', {
-            'fields': ('is_active', 'is_staff', 'is_superuser', 'groups', 'user_permissions'),
-        }),
-        ('Important dates', {'fields': ('last_login', 'date_joined')}),
-    )
-    add_fieldsets = (
-        (None, {
-            'classes': ('wide',),
-            'fields': ('email', 'username', 'usable_password', 'password1', 'password2'),
-        }),
-    )
 
     @admin.display(description='User type', ordering='profile__user_type')
     def user_type(self, obj):
@@ -52,14 +28,17 @@ class UserAdmin(BaseUserAdmin):
         return super().get_inline_instances(request, obj)
 
 
+admin.site.unregister(User)
+admin.site.register(User, UserAdmin)
+
+
 @admin.register(Invitation)
 class InvitationAdmin(admin.ModelAdmin):
     """Read-only view of passwordless login invitations, for debugging."""
 
     list_display = ('user', 'created_at', 'expires_at', 'used_at')
-    search_fields = ('user__email', 'user__username')
-    exclude = ('token',)
-    readonly_fields = ('user', 'created_at', 'expires_at', 'used_at')
+    search_fields = ('user__username', 'user__email')
+    readonly_fields = ('user', 'token_hash', 'created_at', 'expires_at', 'used_at')
 
     def has_add_permission(self, request):
         return False

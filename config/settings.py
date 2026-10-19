@@ -16,14 +16,6 @@ from pathlib import Path
 
 from dotenv import load_dotenv
 
-from cloudSyncAPI.constants import (
-    DEFAULT_FROM_EMAIL_FALLBACK,
-    DEFAULT_PAGE_SIZE,
-    DEFAULT_SITE_URL,
-    DEFAULT_THROTTLE_RATE_INVITATION,
-    THROTTLE_SCOPE_INVITATION,
-)
-
 # Build paths inside the project like this: BASE_DIR / 'subdir'.
 BASE_DIR = Path(__file__).resolve().parent.parent
 
@@ -105,10 +97,6 @@ DATABASES = {
 }
 
 
-# Custom user model (email login, optional username)
-AUTH_USER_MODEL = 'cloudSyncAPI.User'
-
-
 # Password validation
 # https://docs.djangoproject.com/en/6.1/ref/settings/#auth-password-validators
 
@@ -152,29 +140,25 @@ MEDIA_ROOT = BASE_DIR / 'media'
 # Email
 # https://docs.djangoproject.com/en/6.1/topics/email/#topic-email-configuration
 
-# Real emails are sent over SMTP (Gmail in production or MailHog in development)
-# when SMTP_HOST or SMTP_USER/SMTP_PASSWORD are set. Otherwise console fallback.
-SMTP_HOST = os.environ.get('SMTP_HOST', '')
-SMTP_PORT = int(
-    os.environ.get('SMTP_PORT', '1025' if SMTP_HOST in ('localhost', '127.0.0.1', 'mailhog') else '587')
-)
+# Real emails are sent over SMTP (Gmail by default) when SMTP_USER and SMTP_PASSWORD are
+# set in the environment / .env file. Otherwise emails are printed to the console.
+# For Gmail, SMTP_PASSWORD must be an App Password (not your normal password).
+# Port 587 uses STARTTLS (SMTP_USE_TLS=True); port 465 uses SSL (SMTP_USE_SSL=True,
+# SMTP_USE_TLS=False). Use 465 if your network blocks 587.
 SMTP_USER = os.environ.get('SMTP_USER', '')
 SMTP_PASSWORD = os.environ.get('SMTP_PASSWORD', '')
 SMTP_USE_SSL = os.environ.get('SMTP_USE_SSL', 'False').lower() == 'true'
 SMTP_USE_TLS = (
-    os.environ.get(
-        'SMTP_USE_TLS',
-        'False' if (SMTP_USE_SSL or SMTP_HOST in ('localhost', '127.0.0.1', 'mailhog')) else 'True',
-    ).lower() == 'true'
+    os.environ.get('SMTP_USE_TLS', 'False' if SMTP_USE_SSL else 'True').lower() == 'true'
 )
 
-if SMTP_HOST or (SMTP_USER and SMTP_PASSWORD):
+if SMTP_USER and SMTP_PASSWORD:
     MAILERS = {
         'default': {
             'BACKEND': 'django.core.mail.backends.smtp.EmailBackend',
             'OPTIONS': {
-                'host': SMTP_HOST or 'smtp.gmail.com',
-                'port': SMTP_PORT,
+                'host': os.environ.get('SMTP_HOST', 'smtp.gmail.com'),
+                'port': int(os.environ.get('SMTP_PORT', '587')),
                 'use_tls': SMTP_USE_TLS,
                 'use_ssl': SMTP_USE_SSL,
                 'username': SMTP_USER,
@@ -201,11 +185,9 @@ REST_FRAMEWORK = {
         'rest_framework.permissions.IsAuthenticated',
     ),
     'DEFAULT_PAGINATION_CLASS': 'rest_framework.pagination.PageNumberPagination',
-    'PAGE_SIZE': int(os.environ.get('PAGE_SIZE', DEFAULT_PAGE_SIZE)),
+    'PAGE_SIZE': 20,
     'DEFAULT_THROTTLE_RATES': {
-        THROTTLE_SCOPE_INVITATION: os.environ.get(
-            'THROTTLE_RATE_INVITATION', DEFAULT_THROTTLE_RATE_INVITATION
-        ),
+        'invitation': '5/hour',
     },
 }
 
@@ -219,8 +201,11 @@ SIMPLE_JWT = {
 
 
 # Passwordless login (Invitation)
+
+# Minutes a login link stays valid if it is not clicked.
+INVITATION_EXPIRY_MINUTES = 10
 # Base URL used to build the link sent by email (point this at your frontend/domain later).
-SITE_URL = os.environ.get('SITE_URL', DEFAULT_SITE_URL)
+SITE_URL = os.environ.get('SITE_URL', 'http://127.0.0.1:8000')
 DEFAULT_FROM_EMAIL = os.environ.get(
-    'DEFAULT_FROM_EMAIL', SMTP_USER or DEFAULT_FROM_EMAIL_FALLBACK
+    'DEFAULT_FROM_EMAIL', SMTP_USER or 'no-reply@cloudsync.local'
 )

@@ -1,23 +1,24 @@
 import logging
 
-from django.contrib.auth import get_user_model
+from django.conf import settings
+from django.contrib.auth.models import User, update_last_login
+from django.core.mail import send_mail
+from django.urls import reverse
 from rest_framework import mixins, status, viewsets
 from rest_framework.generics import CreateAPIView, GenericAPIView, RetrieveUpdateAPIView
 from rest_framework.permissions import AllowAny, IsAdminUser, IsAuthenticated
 from rest_framework.response import Response
 from rest_framework.throttling import ScopedRateThrottle
 from rest_framework_simplejwt.exceptions import TokenError
+from rest_framework_simplejwt.tokens import RefreshToken
 
-from .constants import Messages, THROTTLE_SCOPE_INVITATION
-from .models import Profile
+from .models import Invitation, Profile
 from .permissions import IsPaidUser, user_is_paid
 from .serializers import (
     AdminUserSerializer, ChangePasswordSerializer, InvitationRequestSerializer,
     InvitationVerifySerializer, LogoutSerializer, RegisterSerializer, UserSerializer,
 )
-from .services import send_login_invitation, verify_invitation_login
 
-User = get_user_model()
 logger = logging.getLogger(__name__)
 
 
@@ -34,13 +35,13 @@ class LogoutView(GenericAPIView):
         serializer = self.get_serializer(data=request.data)
         serializer.is_valid(raise_exception=True)
         try:
-            serializer.save()
+            RefreshToken(serializer.validated_data['refresh']).blacklist()
         except TokenError:
             return Response(
-                {'detail': Messages.INVALID_REFRESH_TOKEN},
+                {'detail': 'Invalid or expired refresh token.'},
                 status=status.HTTP_400_BAD_REQUEST,
             )
-        return Response({'detail': Messages.LOGGED_OUT})
+        return Response({'detail': 'Logged out successfully.'})
 
 
 class ChangePasswordView(GenericAPIView):
@@ -50,8 +51,9 @@ class ChangePasswordView(GenericAPIView):
     def post(self, request):
         serializer = self.get_serializer(data=request.data)
         serializer.is_valid(raise_exception=True)
-        serializer.save()
-        return Response({'detail': Messages.PASSWORD_UPDATED})
+        request.user.set_password(serializer.validated_data['new_password'])
+        request.user.save()
+        return Response({'detail': 'Password updated successfully.'})
 
 
 class ProfileView(RetrieveUpdateAPIView):
@@ -84,9 +86,6 @@ class AdminUserViewSet(
     permission_classes = [IsAdminUser]
     http_method_names = ['get', 'patch', 'delete', 'head', 'options']
 
-
-
-# filter backend
     def get_queryset(self):
         qs = User.objects.select_related('profile').order_by('id')
         user_type = self.request.query_params.get('user_type')
@@ -97,7 +96,7 @@ class AdminUserViewSet(
     def destroy(self, request, *args, **kwargs):
         if self.get_object() == request.user:
             return Response(
-                {'detail': Messages.CANNOT_DELETE_SELF},
+                {'detail': 'You cannot delete your own account.'},
                 status=status.HTTP_400_BAD_REQUEST,
             )
         return super().destroy(request, *args, **kwargs)
@@ -109,7 +108,7 @@ class PaidPingView(GenericAPIView):
     permission_classes = [IsAuthenticated, IsPaidUser]
 
     def get(self, request):
-        return Response({'detail': Messages.PAID_PING})
+        return Response({'detail': 'Welcome, paid user!'})
 
 
 class InvitationRequestView(GenericAPIView):
@@ -125,14 +124,14 @@ class InvitationRequestView(GenericAPIView):
     permission_classes = [AllowAny]
     authentication_classes = []
     throttle_classes = [ScopedRateThrottle]
-    throttle_scope = THROTTLE_SCOPE_INVITATION
+    throttle_scope = 'invitation'
 
     SUCCESS_RESPONSE = {
-        'detail': Messages.LOGIN_LINK_SENT
+        'detail': 'A login link has been sent to your email.'
     }
 
     DENIED_RESPONSE = {
-        'detail': Messages.NOT_PAID_ACCOUNT
+        'detail': 'This email does not belong to a paid account.'
     }
 
     def post(self, request):
@@ -140,19 +139,34 @@ class InvitationRequestView(GenericAPIView):
         serializer.is_valid(raise_exception=True)
         email = serializer.validated_data['email']
 
-        user = (
-            User.objects.select_related('profile')
-            .filter(email__iexact=email, is_active=True)
-            .first()
+        users = list(
+            User.objects.select_related('profile').filter(email__iexact=email, is_active=True)
         )
-        if user is not None and user_is_paid(user):
-            send_login_invitation(user)
+        if len(users) == 1 and user_is_paid(users[0]):
+            self._send_invitation(users[0])
             return Response(self.SUCCESS_RESPONSE)
 
         return Response(self.DENIED_RESPONSE, status=status.HTTP_403_FORBIDDEN)
 
-    # Backward compatibility alias
-    _send_invitation = staticmethod(send_login_invitation)
+    def _send_invitation(self, user):
+        raw_token = Invitation.issue_for(user)
+        link = f"{settings.SITE_URL.rstrip('/')}{reverse('invitation-verify')}?token={raw_token}"
+        minutes = settings.INVITATION_EXPIRY_MINUTES
+        try:
+            send_mail(
+                subject='Your login link',
+                message=(
+                    f'Hello {user.username},\n\n'
+                    f'Click the link below to log in. It can be used once and expires '
+                    f'in {minutes} minutes.\n\n{link}\n\n'
+                    f'If you did not request this, you can ignore this email.'
+                ),
+                from_email=settings.DEFAULT_FROM_EMAIL,
+                recipient_list=[user.email],
+            )
+        except Exception:
+            # A mail failure must not turn into a 500; it is logged for the developer.
+            logger.exception('Failed to send login invitation to user %s', user.pk)
 
 
 class InvitationVerifyView(GenericAPIView):
@@ -166,16 +180,18 @@ class InvitationVerifyView(GenericAPIView):
         serializer = self.get_serializer(data=request.query_params)
         serializer.is_valid(raise_exception=True)
 
-        result = verify_invitation_login(serializer.validated_data['token'])
-        if result is None:
+        user = Invitation.consume(serializer.validated_data['token'])
+        # Eligibility is re-checked at click time (user may have been downgraded/deactivated).
+        if user is None or not user_is_paid(user):
             return Response(
-                {'detail': Messages.LINK_INVALID_OR_EXPIRED},
+                {'detail': 'This login link is invalid or has expired.'},
                 status=status.HTTP_400_BAD_REQUEST,
             )
 
-        user, refresh = result
+        update_last_login(None, user)
+        refresh = RefreshToken.for_user(user)
         response = Response({
-            'detail': Messages.LOGGED_IN,
+            'detail': 'Logged in successfully.',
             'refresh': str(refresh),
             'access': str(refresh.access_token),
         })

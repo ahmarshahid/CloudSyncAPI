@@ -1,13 +1,9 @@
-from django.contrib.auth import get_user_model
+from django.contrib.auth.models import User
 from django.contrib.auth.password_validation import validate_password
 from rest_framework import serializers
 from rest_framework.validators import UniqueValidator
-from rest_framework_simplejwt.tokens import RefreshToken
 
-from .choices import UserType
 from .models import Profile
-
-User = get_user_model()
 
 
 class RegisterSerializer(serializers.ModelSerializer):
@@ -23,9 +19,8 @@ class RegisterSerializer(serializers.ModelSerializer):
 
     class Meta:
         model = User
-        fields = ['email', 'password', 'password2', 'username', 'first_name', 'last_name']
+        fields = ['username', 'email', 'password', 'password2', 'first_name', 'last_name']
         extra_kwargs = {
-            'username': {'required': False},
             'first_name': {'required': False},
             'last_name': {'required': False},
         }
@@ -55,8 +50,8 @@ class UserSerializer(serializers.ModelSerializer):
 
     class Meta:
         model = User
-        fields = ['id', 'email', 'username', 'first_name', 'last_name', 'profile']
-        read_only_fields = ['id']
+        fields = ['id', 'username', 'email', 'first_name', 'last_name', 'profile']
+        read_only_fields = ['id', 'username']
 
     def validate_email(self, value):
         qs = User.objects.filter(email__iexact=value).exclude(pk=self.instance.pk)
@@ -87,33 +82,24 @@ class ChangePasswordSerializer(serializers.Serializer):
             raise serializers.ValidationError('Old password is incorrect.')
         return value
 
-    def save(self, **kwargs):
-        user = self.context['request'].user
-        user.set_password(self.validated_data['new_password'])
-        user.save()
-        return user
-
 
 class LogoutSerializer(serializers.Serializer):
     refresh = serializers.CharField(write_only=True)
 
-    def save(self, **kwargs):
-        RefreshToken(self.validated_data['refresh']).blacklist()
-
 
 class AdminUserSerializer(serializers.ModelSerializer):
     user_type = serializers.ChoiceField(
-        choices=UserType.choices, source='profile.user_type', required=False
+        choices=Profile.UserType.choices, source='profile.user_type', required=False
     )
 
     class Meta:
         model = User
         fields = [
-            'id', 'email', 'username', 'first_name', 'last_name',
+            'id', 'username', 'email', 'first_name', 'last_name',
             'is_active', 'is_staff', 'date_joined', 'user_type',
         ]
         read_only_fields = [
-            'id', 'email', 'username', 'first_name', 'last_name',
+            'id', 'username', 'email', 'first_name', 'last_name',
             'is_staff', 'date_joined',
         ]
 
@@ -137,4 +123,4 @@ class InvitationRequestSerializer(serializers.Serializer):
 
 
 class InvitationVerifySerializer(serializers.Serializer):
-    token = serializers.UUIDField()
+    token = serializers.CharField(max_length=200)
