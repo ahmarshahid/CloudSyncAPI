@@ -1,6 +1,8 @@
 .env
 .venv/
+.env.example
 __pycache__/
 *.pyc
 media/
-db.sqlite3
+db.sqlite3*
+mailhog

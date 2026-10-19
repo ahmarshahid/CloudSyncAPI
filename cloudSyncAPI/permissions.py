@@ -1,22 +1,24 @@
 from rest_framework.permissions import BasePermission
 
-from .models import Profile
+from .choices import UserType
+from .constants import Messages
 
 
 def user_is_paid(user):
     """True for an active user whose profile is Paid."""
+    # By default it will return the bool
     return bool(
         user
         and user.is_active
         and hasattr(user, 'profile')
-        and user.profile.user_type == Profile.UserType.PAID
+        and user.profile.user_type == UserType.PAID
     )
 
 
 class IsPaidUser(BasePermission):
     """Allows access only to authenticated users whose profile is Paid."""
 
-    message = 'This feature is available for paid users only.'
+    message = Messages.PAID_ONLY
 
     def has_permission(self, request, view):
         user = request.user
