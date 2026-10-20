@@ -3,7 +3,7 @@ from django.contrib.auth import get_user_model
 from django.contrib.auth.admin import UserAdmin as BaseUserAdmin
 
 from .forms import UserAdminChangeForm, UserAdminCreationForm
-from .models import Invitation, Profile
+from .models import GoogleDriveCredential, Invitation, Profile
 
 User = get_user_model()
 
@@ -11,6 +11,8 @@ User = get_user_model()
 class ProfileInline(admin.StackedInline):
     model = Profile
     can_delete = False
+
+
 
 
 @admin.register(User)
@@ -63,3 +65,26 @@ class InvitationAdmin(admin.ModelAdmin):
 
     def has_add_permission(self, request):
         return False
+
+
+@admin.register(GoogleDriveCredential)
+class GoogleDriveCredentialAdmin(admin.ModelAdmin):
+    """Admin view of connected Google Drive accounts, protecting raw tokens."""
+
+    list_display = ('user', 'expiry', 'created_at', 'updated_at')
+    search_fields = ('user__email', 'user__username')
+    readonly_fields = (
+        'user',
+        'token_uri',
+        'client_id',
+        'client_secret',
+        'scopes',
+        'expiry',
+        'created_at',
+        'updated_at',
+    )
+    exclude = ('access_token', 'refresh_token')
+
+    def has_add_permission(self, request):
+        return False
+

@@ -138,3 +138,46 @@ class InvitationRequestSerializer(serializers.Serializer):
 
 class InvitationVerifySerializer(serializers.Serializer):
     token = serializers.UUIDField()
+
+
+# ---------------------------------------------------------------------------
+# Google Drive Serializers
+# ---------------------------------------------------------------------------
+
+class GoogleDriveStatusSerializer(serializers.Serializer):
+    """Represents the status and metadata of a user's Google Drive connection."""
+
+    is_connected = serializers.BooleanField()
+    expiry = serializers.DateTimeField(allow_null=True, required=False)
+    created_at = serializers.DateTimeField(allow_null=True, required=False)
+    updated_at = serializers.DateTimeField(allow_null=True, required=False)
+
+
+class GoogleDriveOAuthCallbackSerializer(serializers.Serializer):
+    """Validates the redirect query parameters sent by Google OAuth."""
+
+    code = serializers.CharField(required=False, default=None)
+    state = serializers.CharField(required=True)
+    error = serializers.CharField(required=False, allow_null=True, default=None)
+
+    def validate(self, attrs):
+        if attrs.get('error'):
+            raise serializers.ValidationError({'error': f"Google OAuth error: {attrs['error']}"})
+        if not attrs.get('code'):
+            raise serializers.ValidationError({'code': 'Missing OAuth authorization code.'})
+        return attrs
+
+
+class GoogleDriveFileListQuerySerializer(serializers.Serializer):
+    """Validates query parameters when listing files from Google Drive."""
+
+    page_size = serializers.IntegerField(required=False, default=20, min_value=1, max_value=100)
+    page_token = serializers.CharField(required=False, allow_blank=True, default=None)
+    query = serializers.CharField(required=False, allow_blank=True, default=None)
+
+
+class GoogleDriveFileUploadSerializer(serializers.Serializer):
+    """Validates file upload payload for Google Drive."""
+
+    file = serializers.FileField(required=True)
+

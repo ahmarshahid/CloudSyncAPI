@@ -3,7 +3,9 @@ from rest_framework.routers import SimpleRouter
 from rest_framework_simplejwt.views import TokenObtainPairView, TokenRefreshView
 
 from .views import (
-    AdminUserViewSet, ChangePasswordView, InvitationRequestView, InvitationVerifyView,
+    AdminUserViewSet, ChangePasswordView, GoogleDriveCallbackView,
+    GoogleDriveConnectView, GoogleDriveFileDetailView, GoogleDriveFilesView,
+    GoogleDriveStatusView, InvitationRequestView, InvitationVerifyView,
     LogoutView, PaidPingView, ProfileView, RegisterView,
 )
 
@@ -28,5 +30,17 @@ urlpatterns = [
     ),
     path('profile/', ProfileView.as_view(), name='profile'),
     path('paid/ping/', PaidPingView.as_view(), name='paid-ping'),
+
+    # Google Drive Integration
+    path('drive/connect/', GoogleDriveConnectView.as_view(), name='drive-connect'),
+    path('drive/callback/', GoogleDriveCallbackView.as_view(), name='drive-callback'),
+    path('drive/status/', GoogleDriveStatusView.as_view(), name='drive-status'),
+    path('drive/files/', GoogleDriveFilesView.as_view(), name='drive-files'),
+    path('drive/files', GoogleDriveFilesView.as_view()),
+    path('drive/files/<str:file_id>/', GoogleDriveFileDetailView.as_view(), name='drive-file-detail'),
+    path('drive/files/<str:file_id>', GoogleDriveFileDetailView.as_view()),
+
+
     path('', include(router.urls)),
 ]
+

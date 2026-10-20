@@ -10,7 +10,17 @@ from django.utils import timezone
 from rest_framework import status
 from rest_framework.test import APITestCase
 
-from .models import Invitation, Profile
+from unittest.mock import MagicMock, patch
+
+from .constants import Messages
+from .models import GoogleDriveCredential, Invitation, Profile, UserType
+from .services import (
+    get_missing_profile_fields, process_incomplete_profile_reminders,
+    send_drive_action_notification, send_profile_completion_reminder,
+)
+from .tasks import send_incomplete_profile_reminders
+
+
 
 User = get_user_model()
 
@@ -46,7 +56,7 @@ class UserManagerTests(TestCase):
 
     def test_profile_is_created_automatically_as_free(self):
         user = User.objects.create_user('bob@example.com', PASSWORD)
-        self.assertEqual(user.profile.user_type, Profile.UserType.FREE)
+        self.assertEqual(user.profile.user_type, UserType.FREE)
 
     def test_email_is_unique_case_insensitively(self):
         User.objects.create_user('bob@example.com', PASSWORD)
@@ -431,3 +441,230 @@ class PasswordlessLoginTests(APITestCase):
         for _ in range(5):
             self.assertEqual(self.request_link().status_code, status.HTTP_200_OK)
         self.assertEqual(self.request_link().status_code, status.HTTP_429_TOO_MANY_REQUESTS)
+
+
+class GoogleDriveTests(APITestCase):
+    CONNECT_URL = '/api/drive/connect/'
+    CALLBACK_URL = '/api/drive/callback/'
+    STATUS_URL = '/api/drive/status/'
+    FILES_URL = '/api/drive/files/'
+    FILE_DETAIL_URL = '/api/drive/files/{file_id}/'
+
+    def setUp(self):
+        self.free_user = User.objects.create_user('free@example.com', PASSWORD)
+        self.free_user.profile.user_type = UserType.FREE
+        self.free_user.profile.save()
+
+        self.paid_user = User.objects.create_user('paid@example.com', PASSWORD)
+        self.paid_user.profile.user_type = UserType.PAID
+        self.paid_user.profile.save()
+
+    def _attach_drive_credential(self, user):
+        return GoogleDriveCredential.objects.create(
+            user=user,
+            access_token='ya29.mock_token',
+            refresh_token='1//mock_refresh',
+            token_uri='https://oauth2.googleapis.com/token',
+            client_id='mock_client_id',
+            client_secret='mock_client_secret',
+            scopes='["https://www.googleapis.com/auth/drive"]',
+            expiry=timezone.now() + timedelta(hours=1),
+        )
+
+    def test_unauthenticated_requests_are_rejected(self):
+        self.assertEqual(self.client.get(self.CONNECT_URL).status_code, status.HTTP_401_UNAUTHORIZED)
+        self.assertEqual(self.client.get(self.STATUS_URL).status_code, status.HTTP_401_UNAUTHORIZED)
+        self.assertEqual(self.client.get(self.FILES_URL).status_code, status.HTTP_401_UNAUTHORIZED)
+        self.assertEqual(self.client.post(self.FILES_URL).status_code, status.HTTP_401_UNAUTHORIZED)
+        detail_url = self.FILE_DETAIL_URL.format(file_id='file123')
+        self.assertEqual(self.client.get(detail_url).status_code, status.HTTP_401_UNAUTHORIZED)
+        self.assertEqual(self.client.delete(detail_url).status_code, status.HTTP_401_UNAUTHORIZED)
+
+    def test_drive_not_connected_returns_forbidden(self):
+        # Paid user has no GoogleDriveCredential yet
+        self.client.force_authenticate(user=self.paid_user)
+        res = self.client.get(self.FILES_URL)
+        self.assertEqual(res.status_code, status.HTTP_403_FORBIDDEN)
+        self.assertIn(Messages.DRIVE_NOT_CONNECTED, str(res.data))
+
+        # Free user has no GoogleDriveCredential yet
+        self.client.force_authenticate(user=self.free_user)
+        res = self.client.get(self.FILES_URL)
+        self.assertEqual(res.status_code, status.HTTP_403_FORBIDDEN)
+        self.assertIn(Messages.DRIVE_NOT_CONNECTED, str(res.data))
+
+    @patch('cloudSyncAPI.views.generate_google_oauth_url')
+    def test_connect_endpoint_returns_auth_url(self, mock_gen_url):
+        mock_gen_url.return_value = ('https://accounts.google.com/o/oauth2/v2/auth?test=1', 'state_abc')
+        self.client.force_authenticate(user=self.paid_user)
+        res = self.client.get(self.CONNECT_URL)
+        self.assertEqual(res.status_code, status.HTTP_200_OK)
+        self.assertIn('authorization_url', res.data)
+        self.assertEqual(res.data['authorization_url'], 'https://accounts.google.com/o/oauth2/v2/auth?test=1')
+
+    def test_status_endpoint_reports_connection_and_disconnects(self):
+        self.client.force_authenticate(user=self.paid_user)
+
+        # Before connection
+        res = self.client.get(self.STATUS_URL)
+        self.assertEqual(res.status_code, status.HTTP_200_OK)
+        self.assertFalse(res.data['is_connected'])
+
+        # After connection
+        self._attach_drive_credential(self.paid_user)
+        res = self.client.get(self.STATUS_URL)
+        self.assertEqual(res.status_code, status.HTTP_200_OK)
+        self.assertTrue(res.data['is_connected'])
+
+        # Disconnect
+        del_res = self.client.delete(self.STATUS_URL)
+        self.assertEqual(del_res.status_code, status.HTTP_200_OK)
+        self.assertEqual(del_res.data['detail'], Messages.DRIVE_DISCONNECTED_SUCCESS)
+        self.assertFalse(GoogleDriveCredential.objects.filter(user=self.paid_user).exists())
+
+    @patch('cloudSyncAPI.views.list_drive_files')
+    def test_free_user_can_list_files(self, mock_list):
+        mock_list.return_value = {'files': [{'id': '1', 'name': 'test.txt'}], 'next_page_token': None}
+        self._attach_drive_credential(self.free_user)
+        self.client.force_authenticate(user=self.free_user)
+
+        res = self.client.get(self.FILES_URL)
+        self.assertEqual(res.status_code, status.HTTP_200_OK)
+        self.assertEqual(len(res.data['files']), 1)
+        self.assertEqual(res.data['files'][0]['name'], 'test.txt')
+
+    @patch('cloudSyncAPI.views.download_drive_file')
+    def test_free_user_can_download_file(self, mock_download):
+        import io
+        mock_download.return_value = (io.BytesIO(b'file content'), 'doc.txt', 'text/plain')
+        self._attach_drive_credential(self.free_user)
+        self.client.force_authenticate(user=self.free_user)
+
+        res = self.client.get(self.FILE_DETAIL_URL.format(file_id='doc123'))
+        self.assertEqual(res.status_code, status.HTTP_200_OK)
+        self.assertEqual(b''.join(res.streaming_content), b'file content')
+
+    def test_free_user_cannot_upload_file(self):
+        from django.core.files.uploadedfile import SimpleUploadedFile
+        self._attach_drive_credential(self.free_user)
+        self.client.force_authenticate(user=self.free_user)
+
+        dummy_file = SimpleUploadedFile('test.pdf', b'PDF dummy content', content_type='application/pdf')
+        res = self.client.post(self.FILES_URL, {'file': dummy_file}, format='multipart')
+        self.assertEqual(res.status_code, status.HTTP_403_FORBIDDEN)
+        self.assertEqual(res.data['detail'], Messages.PAID_ONLY)
+
+    def test_free_user_cannot_delete_file(self):
+        self._attach_drive_credential(self.free_user)
+        self.client.force_authenticate(user=self.free_user)
+
+        res = self.client.delete(self.FILE_DETAIL_URL.format(file_id='file_xyz'))
+        self.assertEqual(res.status_code, status.HTTP_403_FORBIDDEN)
+        self.assertEqual(res.data['detail'], Messages.PAID_ONLY)
+
+    @patch('cloudSyncAPI.views.upload_drive_file')
+    def test_paid_user_can_upload_file(self, mock_upload):
+        from django.core.files.uploadedfile import SimpleUploadedFile
+        mock_upload.return_value = {'id': 'created123', 'name': 'report.docx'}
+        self._attach_drive_credential(self.paid_user)
+        self.client.force_authenticate(user=self.paid_user)
+
+        dummy_file = SimpleUploadedFile('report.docx', b'Word doc content', content_type='application/msword')
+        res = self.client.post(self.FILES_URL, {'file': dummy_file}, format='multipart')
+        self.assertEqual(res.status_code, status.HTTP_201_CREATED)
+        self.assertEqual(res.data['detail'], Messages.DRIVE_FILE_UPLOADED)
+        self.assertEqual(res.data['file']['name'], 'report.docx')
+
+    @patch('cloudSyncAPI.views.delete_drive_file')
+    def test_paid_user_can_delete_file(self, mock_delete):
+        mock_delete.return_value = 'old_report.docx'
+        self._attach_drive_credential(self.paid_user)
+        self.client.force_authenticate(user=self.paid_user)
+
+        res = self.client.delete(self.FILE_DETAIL_URL.format(file_id='del123'))
+        self.assertEqual(res.status_code, status.HTTP_200_OK)
+        self.assertEqual(res.data['detail'], Messages.DRIVE_FILE_DELETED)
+        self.assertEqual(res.data['file_name'], 'old_report.docx')
+
+    def test_action_notifications_send_emails_with_filename(self):
+        mail.outbox.clear()
+
+        # 1. Test upload notification
+        send_drive_action_notification(self.paid_user, action='uploaded', filename='quarterly_results.xlsx')
+        self.assertEqual(len(mail.outbox), 1)
+        email = mail.outbox[0]
+        self.assertEqual(email.to, ['paid@example.com'])
+        self.assertIn('Uploaded', email.subject)
+        self.assertIn('quarterly_results.xlsx', email.body)
+        self.assertIn('UPLOADED', email.body)
+
+        # 2. Test delete notification
+        send_drive_action_notification(self.paid_user, action='deleted', filename='deprecated_plan.pdf')
+        self.assertEqual(len(mail.outbox), 2)
+        delete_email = mail.outbox[1]
+        self.assertEqual(delete_email.to, ['paid@example.com'])
+        self.assertIn('Deleted', delete_email.subject)
+        self.assertIn('deprecated_plan.pdf', delete_email.body)
+        self.assertIn('DELETED', delete_email.body)
+
+
+class ProfileCompletionReminderTests(TestCase):
+    def setUp(self):
+        cache.clear()
+        mail.outbox.clear()
+        self.user = User.objects.create_user('incomplete@example.com', PASSWORD)
+
+    def test_get_missing_profile_fields_identifies_all_empty_fields(self):
+        missing = get_missing_profile_fields(self.user)
+        self.assertIn('Username', missing)
+        self.assertIn('First Name', missing)
+        self.assertIn('Last Name', missing)
+        self.assertIn('Phone Number', missing)
+        self.assertIn('Date of Birth', missing)
+        self.assertIn('Bio', missing)
+
+    def test_get_missing_profile_fields_returns_empty_when_completed(self):
+        import datetime
+        self.user.username = 'completeuser'
+        self.user.first_name = 'John'
+        self.user.last_name = 'Doe'
+        self.user.save()
+
+        profile = self.user.profile
+        profile.phone = '+123456789'
+        profile.date_of_birth = datetime.date(1995, 5, 20)
+        profile.bio = 'Software Engineer'
+        profile.save()
+
+        missing = get_missing_profile_fields(self.user)
+        self.assertEqual(missing, [])
+
+    def test_send_profile_completion_reminder_sends_email(self):
+        missing = ['Username', 'First Name', 'Phone Number']
+        sent = send_profile_completion_reminder(self.user, missing)
+        self.assertTrue(sent)
+        self.assertEqual(len(mail.outbox), 1)
+        email = mail.outbox[0]
+        self.assertEqual(email.to, [self.user.email])
+        self.assertIn('complete your CloudSync profile', email.subject)
+        self.assertIn('Username', email.body)
+        self.assertIn('First Name', email.body)
+        self.assertIn('Phone Number', email.body)
+
+    def test_process_incomplete_profile_reminders_and_cooldown(self):
+        # 1. First run sends 1 reminder
+        sent = process_incomplete_profile_reminders(cooldown_seconds=300)
+        self.assertEqual(sent, 1)
+        self.assertEqual(len(mail.outbox), 1)
+
+        # 2. Immediate second run is blocked by Redis cache cooldown
+        sent_again = process_incomplete_profile_reminders(cooldown_seconds=300)
+        self.assertEqual(sent_again, 0)
+        self.assertEqual(len(mail.outbox), 1)  # No new email sent
+
+    def test_celery_task_execution(self):
+        count = send_incomplete_profile_reminders.apply(kwargs={'cooldown_seconds': 300}).get()
+        self.assertEqual(count, 1)
+        self.assertEqual(len(mail.outbox), 1)
+
+
