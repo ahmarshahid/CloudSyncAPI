@@ -10,7 +10,12 @@ from rest_framework.response import Response
 from rest_framework.throttling import ScopedRateThrottle
 from rest_framework_simplejwt.exceptions import TokenError
 
-from .constants import Messages, THROTTLE_SCOPE_INVITATION
+from .constants import (
+    CANNOT_DELETE_SELF, DRIVE_CONNECTED_SUCCESS, DRIVE_DISCONNECTED_SUCCESS,
+    DRIVE_FILE_DELETED, DRIVE_FILE_UPLOADED, INVALID_REFRESH_TOKEN, LINK_INVALID_OR_EXPIRED,
+    LOGGED_IN, LOGGED_OUT, LOGIN_LINK_SENT, NOT_PAID_ACCOUNT, PAID_PING,
+    PASSWORD_UPDATED, THROTTLE_SCOPE_INVITATION,
+)
 from .models import Profile
 from .permissions import HasGoogleDriveConnected, IsPaidUser, user_has_google_drive, user_is_paid
 from .serializers import (
@@ -19,11 +24,7 @@ from .serializers import (
     GoogleDriveStatusSerializer, InvitationRequestSerializer,
     InvitationVerifySerializer, LogoutSerializer, RegisterSerializer, UserSerializer,
 )
-from .services import (
-    delete_drive_file, disconnect_google_drive, download_drive_file,
-    exchange_google_oauth_code, generate_google_oauth_url, list_drive_files,
-    send_login_invitation, upload_drive_file, verify_invitation_login,
-)
+from .services import GoogleDriveService, InvitationService
 
 User = get_user_model()
 logger = logging.getLogger(__name__)
@@ -46,10 +47,10 @@ class LogoutView(GenericAPIView):
             serializer.save()
         except TokenError:
             return Response(
-                {'detail': Messages.INVALID_REFRESH_TOKEN},
+                {'detail': INVALID_REFRESH_TOKEN},
                 status=status.HTTP_400_BAD_REQUEST,
             )
-        return Response({'detail': Messages.LOGGED_OUT})
+        return Response({'detail': LOGGED_OUT})
 
 
 class ChangePasswordView(GenericAPIView):
@@ -60,7 +61,7 @@ class ChangePasswordView(GenericAPIView):
         serializer = self.get_serializer(data=request.data)
         serializer.is_valid(raise_exception=True)
         serializer.save()
-        return Response({'detail': Messages.PASSWORD_UPDATED})
+        return Response({'detail': PASSWORD_UPDATED})
 
 
 class ProfileView(RetrieveUpdateAPIView):
@@ -106,7 +107,7 @@ class AdminUserViewSet(
     def destroy(self, request, *args, **kwargs):
         if self.get_object() == request.user:
             return Response(
-                {'detail': Messages.CANNOT_DELETE_SELF},
+                {'detail': CANNOT_DELETE_SELF},
                 status=status.HTTP_400_BAD_REQUEST,
             )
         return super().destroy(request, *args, **kwargs)
@@ -118,7 +119,7 @@ class PaidPingView(GenericAPIView):
     permission_classes = [IsAuthenticated, IsPaidUser]
 
     def get(self, request):
-        return Response({'detail': Messages.PAID_PING})
+        return Response({'detail': PAID_PING})
 
 
 class InvitationRequestView(GenericAPIView):
@@ -137,11 +138,11 @@ class InvitationRequestView(GenericAPIView):
     throttle_scope = THROTTLE_SCOPE_INVITATION
 
     SUCCESS_RESPONSE = {
-        'detail': Messages.LOGIN_LINK_SENT
+        'detail': LOGIN_LINK_SENT
     }
 
     DENIED_RESPONSE = {
-        'detail': Messages.NOT_PAID_ACCOUNT
+        'detail': NOT_PAID_ACCOUNT
     }
 
     def post(self, request):
@@ -155,13 +156,13 @@ class InvitationRequestView(GenericAPIView):
             .first()
         )
         if user is not None and user_is_paid(user):
-            send_login_invitation(user)
+            InvitationService.send_invitation(user)
             return Response(self.SUCCESS_RESPONSE)
 
         return Response(self.DENIED_RESPONSE, status=status.HTTP_403_FORBIDDEN)
 
     # Backward compatibility alias
-    _send_invitation = staticmethod(send_login_invitation)
+    _send_invitation = staticmethod(InvitationService.send_invitation)
 
 
 class InvitationVerifyView(GenericAPIView):
@@ -175,16 +176,16 @@ class InvitationVerifyView(GenericAPIView):
         serializer = self.get_serializer(data=request.query_params)
         serializer.is_valid(raise_exception=True)
 
-        result = verify_invitation_login(serializer.validated_data['token'])
+        result = InvitationService.verify_token(serializer.validated_data['token'])
         if result is None:
             return Response(
-                {'detail': Messages.LINK_INVALID_OR_EXPIRED},
+                {'detail': LINK_INVALID_OR_EXPIRED},
                 status=status.HTTP_400_BAD_REQUEST,
             )
 
         user, refresh = result
         response = Response({
-            'detail': Messages.LOGGED_IN,
+            'detail': LOGGED_IN,
             'refresh': str(refresh),
             'access': str(refresh.access_token),
         })
@@ -205,7 +206,7 @@ class GoogleDriveConnectView(GenericAPIView):
     permission_classes = [IsAuthenticated]
 
     def get(self, request):
-        authorization_url, _ = generate_google_oauth_url(request.user)
+        authorization_url, _ = GoogleDriveService.generate_oauth_url(request.user)
         return Response({'authorization_url': authorization_url})
 
 
@@ -214,7 +215,7 @@ class GoogleDriveCallbackView(GenericAPIView):
     OAuth 2.0 redirect endpoint. Google redirects here with ?code=...&state=...
     Exchanges authorization code for credentials and links Google Drive to the user.
     """
-
+# these also need to check by the authentication and permission classes.........
     permission_classes = [AllowAny]
     authentication_classes = []
     serializer_class = GoogleDriveOAuthCallbackSerializer
@@ -223,12 +224,12 @@ class GoogleDriveCallbackView(GenericAPIView):
         serializer = self.get_serializer(data=request.query_params)
         serializer.is_valid(raise_exception=True)
 
-        user, _ = exchange_google_oauth_code(
+        user, _ = GoogleDriveService.exchange_code(
             code=serializer.validated_data['code'],
             state=serializer.validated_data['state'],
         )
         return Response({
-            'detail': Messages.DRIVE_CONNECTED_SUCCESS,
+            'detail': DRIVE_CONNECTED_SUCCESS,
             'email': user.email,
         })
 
@@ -266,8 +267,8 @@ class GoogleDriveStatusView(GenericAPIView):
         return Response(serializer.data)
 
     def delete(self, request):
-        disconnect_google_drive(request.user)
-        return Response({'detail': Messages.DRIVE_DISCONNECTED_SUCCESS})
+        GoogleDriveService.disconnect_user(request.user)
+        return Response({'detail': DRIVE_DISCONNECTED_SUCCESS})
 
 
 class GoogleDriveFilesView(GenericAPIView):
@@ -293,7 +294,7 @@ class GoogleDriveFilesView(GenericAPIView):
         serializer = self.get_serializer(data=request.query_params)
         serializer.is_valid(raise_exception=True)
 
-        data = list_drive_files(
+        data = GoogleDriveService.list_files(
             user=request.user,
             page_size=serializer.validated_data.get('page_size', 20),
             page_token=serializer.validated_data.get('page_token'),
@@ -306,10 +307,10 @@ class GoogleDriveFilesView(GenericAPIView):
         serializer.is_valid(raise_exception=True)
 
         uploaded_file = serializer.validated_data['file']
-        file_info = upload_drive_file(request.user, uploaded_file)
+        file_info = GoogleDriveService.upload_file(request.user, uploaded_file)
         return Response(
             {
-                'detail': Messages.DRIVE_FILE_UPLOADED,
+                'detail': DRIVE_FILE_UPLOADED,
                 'file': file_info,
             },
             status=status.HTTP_201_CREATED,
@@ -329,7 +330,7 @@ class GoogleDriveFileDetailView(GenericAPIView):
         return [IsAuthenticated(), HasGoogleDriveConnected()]
 
     def get(self, request, file_id):
-        buffer, filename, mime_type = download_drive_file(request.user, file_id)
+        buffer, filename, mime_type = GoogleDriveService.download_file(request.user, file_id)
         return FileResponse(
             buffer,
             as_attachment=True,
@@ -338,9 +339,9 @@ class GoogleDriveFileDetailView(GenericAPIView):
         )
 
     def delete(self, request, file_id):
-        filename = delete_drive_file(request.user, file_id)
+        filename = GoogleDriveService.delete_file(request.user, file_id)
         return Response({
-            'detail': Messages.DRIVE_FILE_DELETED,
+            'detail': DRIVE_FILE_DELETED,
             'file_name': filename,
         })
 

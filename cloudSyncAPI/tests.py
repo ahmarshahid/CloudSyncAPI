@@ -12,12 +12,9 @@ from rest_framework.test import APITestCase
 
 from unittest.mock import MagicMock, patch
 
-from .constants import Messages
+from .constants import DRIVE_DISCONNECTED_SUCCESS, DRIVE_FILE_DELETED, DRIVE_FILE_UPLOADED, DRIVE_NOT_CONNECTED, PAID_ONLY
 from .models import GoogleDriveCredential, Invitation, Profile, UserType
-from .services import (
-    get_missing_profile_fields, process_incomplete_profile_reminders,
-    send_drive_action_notification, send_profile_completion_reminder,
-)
+from .services import GoogleDriveService, ProfileReminderService
 from .tasks import send_incomplete_profile_reminders
 
 
@@ -485,15 +482,15 @@ class GoogleDriveTests(APITestCase):
         self.client.force_authenticate(user=self.paid_user)
         res = self.client.get(self.FILES_URL)
         self.assertEqual(res.status_code, status.HTTP_403_FORBIDDEN)
-        self.assertIn(Messages.DRIVE_NOT_CONNECTED, str(res.data))
+        self.assertIn(DRIVE_NOT_CONNECTED, str(res.data))
 
         # Free user has no GoogleDriveCredential yet
         self.client.force_authenticate(user=self.free_user)
         res = self.client.get(self.FILES_URL)
         self.assertEqual(res.status_code, status.HTTP_403_FORBIDDEN)
-        self.assertIn(Messages.DRIVE_NOT_CONNECTED, str(res.data))
+        self.assertIn(DRIVE_NOT_CONNECTED, str(res.data))
 
-    @patch('cloudSyncAPI.views.generate_google_oauth_url')
+    @patch('cloudSyncAPI.services.GoogleDriveService.generate_oauth_url')
     def test_connect_endpoint_returns_auth_url(self, mock_gen_url):
         mock_gen_url.return_value = ('https://accounts.google.com/o/oauth2/v2/auth?test=1', 'state_abc')
         self.client.force_authenticate(user=self.paid_user)
@@ -519,10 +516,10 @@ class GoogleDriveTests(APITestCase):
         # Disconnect
         del_res = self.client.delete(self.STATUS_URL)
         self.assertEqual(del_res.status_code, status.HTTP_200_OK)
-        self.assertEqual(del_res.data['detail'], Messages.DRIVE_DISCONNECTED_SUCCESS)
+        self.assertEqual(del_res.data['detail'], DRIVE_DISCONNECTED_SUCCESS)
         self.assertFalse(GoogleDriveCredential.objects.filter(user=self.paid_user).exists())
 
-    @patch('cloudSyncAPI.views.list_drive_files')
+    @patch('cloudSyncAPI.services.GoogleDriveService.list_files')
     def test_free_user_can_list_files(self, mock_list):
         mock_list.return_value = {'files': [{'id': '1', 'name': 'test.txt'}], 'next_page_token': None}
         self._attach_drive_credential(self.free_user)
@@ -533,7 +530,7 @@ class GoogleDriveTests(APITestCase):
         self.assertEqual(len(res.data['files']), 1)
         self.assertEqual(res.data['files'][0]['name'], 'test.txt')
 
-    @patch('cloudSyncAPI.views.download_drive_file')
+    @patch('cloudSyncAPI.services.GoogleDriveService.download_file')
     def test_free_user_can_download_file(self, mock_download):
         import io
         mock_download.return_value = (io.BytesIO(b'file content'), 'doc.txt', 'text/plain')
@@ -552,7 +549,7 @@ class GoogleDriveTests(APITestCase):
         dummy_file = SimpleUploadedFile('test.pdf', b'PDF dummy content', content_type='application/pdf')
         res = self.client.post(self.FILES_URL, {'file': dummy_file}, format='multipart')
         self.assertEqual(res.status_code, status.HTTP_403_FORBIDDEN)
-        self.assertEqual(res.data['detail'], Messages.PAID_ONLY)
+        self.assertEqual(res.data['detail'], PAID_ONLY)
 
     def test_free_user_cannot_delete_file(self):
         self._attach_drive_credential(self.free_user)
@@ -560,9 +557,9 @@ class GoogleDriveTests(APITestCase):
 
         res = self.client.delete(self.FILE_DETAIL_URL.format(file_id='file_xyz'))
         self.assertEqual(res.status_code, status.HTTP_403_FORBIDDEN)
-        self.assertEqual(res.data['detail'], Messages.PAID_ONLY)
+        self.assertEqual(res.data['detail'], PAID_ONLY)
 
-    @patch('cloudSyncAPI.views.upload_drive_file')
+    @patch('cloudSyncAPI.services.GoogleDriveService.upload_file')
     def test_paid_user_can_upload_file(self, mock_upload):
         from django.core.files.uploadedfile import SimpleUploadedFile
         mock_upload.return_value = {'id': 'created123', 'name': 'report.docx'}
@@ -572,10 +569,10 @@ class GoogleDriveTests(APITestCase):
         dummy_file = SimpleUploadedFile('report.docx', b'Word doc content', content_type='application/msword')
         res = self.client.post(self.FILES_URL, {'file': dummy_file}, format='multipart')
         self.assertEqual(res.status_code, status.HTTP_201_CREATED)
-        self.assertEqual(res.data['detail'], Messages.DRIVE_FILE_UPLOADED)
+        self.assertEqual(res.data['detail'], DRIVE_FILE_UPLOADED)
         self.assertEqual(res.data['file']['name'], 'report.docx')
 
-    @patch('cloudSyncAPI.views.delete_drive_file')
+    @patch('cloudSyncAPI.services.GoogleDriveService.delete_file')
     def test_paid_user_can_delete_file(self, mock_delete):
         mock_delete.return_value = 'old_report.docx'
         self._attach_drive_credential(self.paid_user)
@@ -583,14 +580,14 @@ class GoogleDriveTests(APITestCase):
 
         res = self.client.delete(self.FILE_DETAIL_URL.format(file_id='del123'))
         self.assertEqual(res.status_code, status.HTTP_200_OK)
-        self.assertEqual(res.data['detail'], Messages.DRIVE_FILE_DELETED)
+        self.assertEqual(res.data['detail'], DRIVE_FILE_DELETED)
         self.assertEqual(res.data['file_name'], 'old_report.docx')
 
     def test_action_notifications_send_emails_with_filename(self):
         mail.outbox.clear()
 
         # 1. Test upload notification
-        send_drive_action_notification(self.paid_user, action='uploaded', filename='quarterly_results.xlsx')
+        GoogleDriveService.send_action_notification(self.paid_user, action='uploaded', filename='quarterly_results.xlsx')
         self.assertEqual(len(mail.outbox), 1)
         email = mail.outbox[0]
         self.assertEqual(email.to, ['paid@example.com'])
@@ -599,13 +596,47 @@ class GoogleDriveTests(APITestCase):
         self.assertIn('UPLOADED', email.body)
 
         # 2. Test delete notification
-        send_drive_action_notification(self.paid_user, action='deleted', filename='deprecated_plan.pdf')
+        GoogleDriveService.send_action_notification(self.paid_user, action='deleted', filename='deprecated_plan.pdf')
         self.assertEqual(len(mail.outbox), 2)
         delete_email = mail.outbox[1]
         self.assertEqual(delete_email.to, ['paid@example.com'])
         self.assertIn('Deleted', delete_email.subject)
         self.assertIn('deprecated_plan.pdf', delete_email.body)
         self.assertIn('DELETED', delete_email.body)
+
+    @patch('cloudSyncAPI.tasks.send_drive_action_notification.delay')
+    def test_drive_action_notification_is_queued_with_action_timestamp(self, mock_delay):
+        GoogleDriveService._queue_action_notification(
+            self.paid_user,
+            action='deleted',
+            filename='report.docx',
+        )
+
+        mock_delay.assert_called_once()
+        user_id, action, filename, timestamp = mock_delay.call_args.args
+        self.assertEqual(user_id, self.paid_user.pk)
+        self.assertEqual(action, 'deleted')
+        self.assertEqual(filename, 'report.docx')
+        self.assertRegex(timestamp, r'^\d{4}-\d{2}-\d{2} \d{2}:\d{2}:\d{2} UTC$')
+
+    @patch('cloudSyncAPI.services.GoogleDriveService.send_action_notification')
+    @patch('cloudSyncAPI.tasks.send_drive_action_notification.delay', side_effect=RuntimeError('broker is down'))
+    def test_drive_action_notification_falls_back_if_queue_is_unavailable(
+        self,
+        mock_delay,
+        mock_send_notification,
+    ):
+        GoogleDriveService._queue_action_notification(
+            self.paid_user,
+            action='uploaded',
+            filename='report.docx',
+        )
+
+        mock_delay.assert_called_once()
+        mock_send_notification.assert_called_once()
+        args, kwargs = mock_send_notification.call_args
+        self.assertEqual(args[:3], (self.paid_user, 'uploaded', 'report.docx'))
+        self.assertRegex(kwargs['timestamp_str'], r'^\d{4}-\d{2}-\d{2} \d{2}:\d{2}:\d{2} UTC$')
 
 
 class ProfileCompletionReminderTests(TestCase):
@@ -615,7 +646,7 @@ class ProfileCompletionReminderTests(TestCase):
         self.user = User.objects.create_user('incomplete@example.com', PASSWORD)
 
     def test_get_missing_profile_fields_identifies_all_empty_fields(self):
-        missing = get_missing_profile_fields(self.user)
+        missing = ProfileReminderService.get_missing_fields(self.user)
         self.assertIn('Username', missing)
         self.assertIn('First Name', missing)
         self.assertIn('Last Name', missing)
@@ -636,12 +667,12 @@ class ProfileCompletionReminderTests(TestCase):
         profile.bio = 'Software Engineer'
         profile.save()
 
-        missing = get_missing_profile_fields(self.user)
+        missing = ProfileReminderService.get_missing_fields(self.user)
         self.assertEqual(missing, [])
 
     def test_send_profile_completion_reminder_sends_email(self):
         missing = ['Username', 'First Name', 'Phone Number']
-        sent = send_profile_completion_reminder(self.user, missing)
+        sent = ProfileReminderService.send_reminder(self.user, missing)
         self.assertTrue(sent)
         self.assertEqual(len(mail.outbox), 1)
         email = mail.outbox[0]
@@ -653,12 +684,12 @@ class ProfileCompletionReminderTests(TestCase):
 
     def test_process_incomplete_profile_reminders_and_cooldown(self):
         # 1. First run sends 1 reminder
-        sent = process_incomplete_profile_reminders(cooldown_seconds=300)
+        sent = ProfileReminderService.process_all_reminders(cooldown_seconds=300)
         self.assertEqual(sent, 1)
         self.assertEqual(len(mail.outbox), 1)
 
         # 2. Immediate second run is blocked by Redis cache cooldown
-        sent_again = process_incomplete_profile_reminders(cooldown_seconds=300)
+        sent_again = ProfileReminderService.process_all_reminders(cooldown_seconds=300)
         self.assertEqual(sent_again, 0)
         self.assertEqual(len(mail.outbox), 1)  # No new email sent
 

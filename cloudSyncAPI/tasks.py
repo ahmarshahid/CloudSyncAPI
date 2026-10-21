@@ -1,10 +1,31 @@
-import logging
-
+from celery.utils.log import get_task_logger
 from celery import shared_task
+from django.contrib.auth import get_user_model
 
 from .services import ProfileReminderService
 
-logger = logging.getLogger(__name__)
+logger = get_task_logger(__name__)
+
+
+@shared_task(
+    bind=True,
+    name='cloudSyncAPI.tasks.send_drive_action_notification',
+    autoretry_for=(Exception,),
+    retry_backoff=True,
+    retry_kwargs={'max_retries': 3},
+)
+def send_drive_action_notification(self, user_id, action, filename, timestamp_str=None):
+    """Send a Google Drive notification asynchronously, retrying mail failures."""
+    from .services import GoogleDriveService
+
+    user = get_user_model().objects.get(pk=user_id)
+    GoogleDriveService.send_action_notification(
+        user,
+        action,
+        filename,
+        timestamp_str=timestamp_str,
+        raise_on_error=True,
+    )
 
 
 @shared_task(name='cloudSyncAPI.tasks.send_incomplete_profile_reminders')
