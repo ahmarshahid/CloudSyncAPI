@@ -1,7 +1,7 @@
 from rest_framework.permissions import BasePermission
 
 from .choices import UserType
-from .constants import Messages
+from .constants import DRIVE_NOT_CONNECTED, PAID_ONLY
 
 
 def user_is_paid(user):
@@ -18,7 +18,7 @@ def user_is_paid(user):
 class IsPaidUser(BasePermission):
     """Allows access only to authenticated users whose profile is Paid."""
 
-    message = Messages.PAID_ONLY
+    message = PAID_ONLY
 
     def has_permission(self, request, view):
         user = request.user
@@ -38,7 +38,7 @@ def user_has_google_drive(user):
 class HasGoogleDriveConnected(BasePermission):
     """Allows access only to users who have an active Google Drive connection."""
 
-    message = Messages.DRIVE_NOT_CONNECTED
+    message = DRIVE_NOT_CONNECTED
 
     def has_permission(self, request, view):
         return user_has_google_drive(request.user)

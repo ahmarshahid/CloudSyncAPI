@@ -10,6 +10,9 @@ from .constants import INVITATION_EXPIRY_MINUTES
 from .managers import UserManager
 
 
+def default_invitation_expiry():
+    return timezone.now() + timedelta(minutes=INVITATION_EXPIRY_MINUTES)
+
 
 class User(AbstractUser):
     """Custom user: logs in with email; username is optional (unique when provided)."""
@@ -89,7 +92,7 @@ class Invitation(TimeStampedModel):
 
     user = models.ForeignKey(User, on_delete=models.CASCADE, related_name='invitations')
     token = models.UUIDField(default=uuid4, unique=True, editable=False)
-    expires_at = models.DateTimeField()
+    expires_at = models.DateTimeField(default=default_invitation_expiry)
     used_at = models.DateTimeField(null=True, blank=True)  # audit only
 
     def __str__(self):
@@ -101,10 +104,7 @@ class Invitation(TimeStampedModel):
         now = timezone.now()
         cls.objects.filter(user=user, expires_at__gt=now).update(expires_at=now)
 
-        invitation = cls.objects.create(
-            user=user,
-            expires_at=now + timedelta(minutes=INVITATION_EXPIRY_MINUTES),
-        )
+        invitation = cls.objects.create(user=user)
         return invitation.token
 
     @classmethod
@@ -144,9 +144,6 @@ class GoogleDriveCredential(TimeStampedModel):
     scopes = models.TextField(blank=True)
     expiry = models.DateTimeField(null=True, blank=True)
 
-    class Meta:
-        verbose_name = 'Google Drive Credential'
-        verbose_name_plural = 'Google Drive Credentials'
 
     def __str__(self):
         return f'Google Drive ({self.user.email})'

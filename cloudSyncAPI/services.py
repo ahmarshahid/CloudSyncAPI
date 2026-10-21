@@ -22,7 +22,10 @@ from googleapiclient.http import MediaIoBaseDownload, MediaIoBaseUpload
 from rest_framework.exceptions import NotFound, ValidationError
 from rest_framework_simplejwt.tokens import RefreshToken
 
-from .constants import GOOGLE_DRIVE_SCOPES, INVITATION_EXPIRY_MINUTES, Messages
+from .constants import (
+    DRIVE_AUTH_FAILED, DRIVE_FILE_NOT_FOUND, DRIVE_NOT_CONNECTED,
+    DRIVE_STATE_MISMATCH, GOOGLE_DRIVE_SCOPES, INVITATION_EXPIRY_MINUTES,
+)
 from .models import GoogleDriveCredential, Invitation
 from .permissions import user_is_paid
 
@@ -192,6 +195,7 @@ class GoogleDriveService:
         rnd = random.SystemRandom()
         code_verifier = ''.join(rnd.choice(chars) for _ in range(128))
         flow.code_verifier = code_verifier
+        #use django default signing.....
 
         signer = TimestampSigner()
         state = signer.sign_object({'user_id': user.pk, 'code_verifier': code_verifier})
@@ -219,7 +223,7 @@ class GoogleDriveService:
         try:
             data = signer.unsign_object(state, max_age=900)  # valid for 15 minutes
         except (BadSignature, SignatureExpired):
-            raise ValidationError({'detail': Messages.DRIVE_STATE_MISMATCH})
+            raise ValidationError({'detail': DRIVE_STATE_MISMATCH})
 
         user_id = data.get('user_id')
         code_verifier = data.get('code_verifier')
@@ -236,7 +240,7 @@ class GoogleDriveService:
             flow.fetch_token(code=code)
         except Exception as exc:
             logger.exception('Failed to fetch Google OAuth token: %s', exc)
-            raise ValidationError({'detail': f'{Messages.DRIVE_AUTH_FAILED}: {str(exc)}'})
+            raise ValidationError({'detail': f'{DRIVE_AUTH_FAILED}: {str(exc)}'})
 
         credentials = flow.credentials
         scopes_json = json.dumps(
@@ -267,7 +271,7 @@ class GoogleDriveService:
         try:
             drive_credential = user.google_drive
         except GoogleDriveCredential.DoesNotExist:
-            raise ValidationError({'detail': Messages.DRIVE_NOT_CONNECTED})
+            raise ValidationError({'detail': DRIVE_NOT_CONNECTED})
 
         drive_credential.delete()
         return True
@@ -288,7 +292,7 @@ class GoogleDriveService:
         try:
             drive_credential = user.google_drive
         except GoogleDriveCredential.DoesNotExist:
-            raise ValidationError({'detail': Messages.DRIVE_NOT_CONNECTED})
+            raise ValidationError({'detail': DRIVE_NOT_CONNECTED})
 
         credentials = cls.build_credentials(drive_credential)
         try:
@@ -297,13 +301,13 @@ class GoogleDriveService:
                 cls.update_tokens(drive_credential, credentials)
         except Exception as exc:
             logger.exception('Failed to refresh Google Drive token for user %s: %s', user.pk, exc)
-            raise ValidationError({'detail': Messages.DRIVE_AUTH_FAILED})
+            raise ValidationError({'detail': DRIVE_AUTH_FAILED})
 
         try:
             return build('drive', 'v3', credentials=credentials, cache_discovery=False)
         except Exception as exc:
             logger.exception('Failed to build Google Drive API client for user %s: %s', user.pk, exc)
-            raise ValidationError({'detail': f'{Messages.DRIVE_AUTH_FAILED}: {str(exc)}'})
+            raise ValidationError({'detail': f'{DRIVE_AUTH_FAILED}: {str(exc)}'})
 
     @classmethod
     def list_files(cls, user=None, page_size=20, page_token=None, query=None):
@@ -352,7 +356,7 @@ class GoogleDriveService:
             meta = service.files().get(fileId=file_id, fields='id, name, mimeType, size').execute()
         except HttpError as exc:
             if exc.resp.status == 404:
-                raise NotFound({'detail': Messages.DRIVE_FILE_NOT_FOUND})
+                raise NotFound({'detail': DRIVE_FILE_NOT_FOUND})
             logger.exception('Error fetching file metadata for %s: %s', file_id, exc)
             raise ValidationError({'detail': f'Google Drive API error: {exc.reason}'})
 
@@ -371,7 +375,7 @@ class GoogleDriveService:
             )
         except HttpError as exc:
             if exc.resp.status == 404:
-                raise NotFound({'detail': Messages.DRIVE_FILE_NOT_FOUND})
+                raise NotFound({'detail': DRIVE_FILE_NOT_FOUND})
             logger.exception('Error downloading Google Drive file %s: %s', file_id, exc)
             raise ValidationError({'detail': f'Google Drive API error: {exc.reason}'})
 
@@ -408,7 +412,7 @@ class GoogleDriveService:
             logger.exception('Unexpected error uploading Google Drive file: %s', exc)
             raise ValidationError({'detail': f'Google Drive error: {str(exc)}'})
 
-        cls.send_action_notification(user, action='uploaded', filename=uploaded_file.name)
+        cls._queue_action_notification(user, action='uploaded', filename=uploaded_file.name)
         return created_file
 
     @classmethod
@@ -426,7 +430,7 @@ class GoogleDriveService:
             filename = meta.get('name', file_id)
         except HttpError as exc:
             if exc.resp.status == 404:
-                raise NotFound({'detail': Messages.DRIVE_FILE_NOT_FOUND})
+                raise NotFound({'detail': DRIVE_FILE_NOT_FOUND})
             logger.exception('Error fetching file metadata for delete %s: %s', file_id, exc)
             raise ValidationError({'detail': f'Google Drive API error: {exc.reason}'})
         except Exception as exc:
@@ -437,24 +441,46 @@ class GoogleDriveService:
             service.files().delete(fileId=file_id).execute()
         except HttpError as exc:
             if exc.resp.status == 404:
-                raise NotFound({'detail': Messages.DRIVE_FILE_NOT_FOUND})
+                raise NotFound({'detail': DRIVE_FILE_NOT_FOUND})
             logger.exception('Error deleting Google Drive file %s: %s', file_id, exc)
             raise ValidationError({'detail': f'Google Drive API error: {exc.reason}'})
         except Exception as exc:
             logger.exception('Unexpected error deleting Google Drive file %s: %s', file_id, exc)
             raise ValidationError({'detail': f'Google Drive error: {str(exc)}'})
-
-        cls.send_action_notification(user, action='deleted', filename=filename)
+        cls._queue_action_notification(user, action='deleted', filename=filename)
         return filename
 
     @staticmethod
-    def send_action_notification(user, action, filename):
+    def _queue_action_notification(user, action, filename):
+        """Queue a Drive notification, falling back to the existing sync path."""
+        timestamp_str = timezone.now().strftime('%Y-%m-%d %H:%M:%S UTC')
+        try:
+            # Import lazily to avoid a circular import: tasks also use services.
+            from .tasks import send_drive_action_notification
+
+            send_drive_action_notification.delay(user.pk, action, filename, timestamp_str)
+        except Exception:
+            logger.exception(
+                'Failed to enqueue file %s notification for user %s; sending synchronously',
+                action,
+                user.pk,
+            )
+            GoogleDriveService.send_action_notification(
+                user,
+                action,
+                filename,
+                timestamp_str=timestamp_str,
+            )
+
+    @staticmethod
+    def send_action_notification(user, action, filename, timestamp_str=None, raise_on_error=False):
         """
         Sends an email notification to the user after a write or delete operation
         on their connected Google Drive.
         """
         subject = f'Google Drive Notification: File {action.capitalize()}'
-        timestamp_str = timezone.now().strftime('%Y-%m-%d %H:%M:%S UTC')
+        if timestamp_str is None:
+            timestamp_str = timezone.now().strftime('%Y-%m-%d %H:%M:%S UTC')
         message = (
             f'Hello {user.first_name or user.username or user.email},\n\n'
             f'A file action was recently performed on your connected Google Drive account:\n\n'
@@ -473,6 +499,8 @@ class GoogleDriveService:
             )
         except Exception:
             logger.exception('Failed to send file %s notification email to %s', action, user.email)
+            if raise_on_error:
+                raise
 
 
 # ===========================================================================
@@ -484,7 +512,7 @@ class ProfileReminderService:
     Scans active users for incomplete profile fields, respects Redis cooldowns
     to prevent spam, and dispatches completion reminder emails.
     """
-
+    
     @staticmethod
     def get_missing_fields(user):
         """
@@ -492,23 +520,16 @@ class ProfileReminderService:
         Monitors: username, first_name, last_name, phone, date_of_birth, bio.
         Returns a list of missing human-readable field labels.
         """
-        missing = []
-        if not user.username:
-            missing.append('Username')
-        if not user.first_name:
-            missing.append('First Name')
-        if not user.last_name:
-            missing.append('Last Name')
-
         profile = getattr(user, 'profile', None)
-        if not profile or not profile.phone:
-            missing.append('Phone Number')
-        if not profile or not profile.date_of_birth:
-            missing.append('Date of Birth')
-        if not profile or not profile.bio:
-            missing.append('Bio')
-
-        return missing
+        checks = [
+            ('Username', user.username),
+            ('First Name', user.first_name),
+            ('Last Name', user.last_name),
+            ('Phone Number', profile.phone if profile else None),
+            ('Date of Birth', profile.date_of_birth if profile else None),
+            ('Bio', profile.bio if profile else None),
+        ]
+        return [label for label, value in checks if not value]
 
     @staticmethod
     def send_reminder(user, missing_fields):
@@ -565,28 +586,3 @@ class ProfileReminderService:
         return sent_count
 
 
-# ===========================================================================
-# 4. Backward Compatibility Aliases
-# ===========================================================================
-# These module-level aliases ensure 100% backward compatibility with all
-# existing imports in views.py, tasks.py, and tests.py.
-
-send_login_invitation = InvitationService.send_invitation
-verify_invitation_login = InvitationService.verify_token
-
-build_google_credentials = GoogleDriveService.build_credentials
-update_drive_credential_tokens = GoogleDriveService.update_tokens
-_get_oauth_flow = GoogleDriveService.get_oauth_flow
-generate_google_oauth_url = GoogleDriveService.generate_oauth_url
-exchange_google_oauth_code = GoogleDriveService.exchange_code
-disconnect_google_drive = GoogleDriveService.disconnect_user
-get_google_drive_service = GoogleDriveService.get_api_client
-list_drive_files = GoogleDriveService.list_files
-download_drive_file = GoogleDriveService.download_file
-upload_drive_file = GoogleDriveService.upload_file
-delete_drive_file = GoogleDriveService.delete_file
-send_drive_action_notification = GoogleDriveService.send_action_notification
-
-get_missing_profile_fields = ProfileReminderService.get_missing_fields
-send_profile_completion_reminder = ProfileReminderService.send_reminder
-process_incomplete_profile_reminders = ProfileReminderService.process_all_reminders
