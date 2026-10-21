@@ -15,6 +15,7 @@ from datetime import timedelta
 from pathlib import Path
 
 from dotenv import load_dotenv
+from celery.schedules import crontab
 
 from cloudSyncAPI.constants import (
     DEFAULT_FROM_EMAIL_FALLBACK,
@@ -245,6 +246,9 @@ CELERY_ACCEPT_CONTENT = ['json']
 CELERY_TASK_SERIALIZER = 'json'
 CELERY_RESULT_SERIALIZER = 'json'
 CELERY_TIMEZONE = TIME_ZONE
-# Profile reminders are enqueued by the system cron job.
-CELERY_BEAT_SCHEDULE = {}
-
+CELERY_BEAT_SCHEDULE = {
+    'send-profile-completion-reminders-every-5-mins': {
+        'task': 'cloudSyncAPI.tasks.send_incomplete_profile_reminders',
+        'schedule': crontab(minute='*/5'),
+    },
+}

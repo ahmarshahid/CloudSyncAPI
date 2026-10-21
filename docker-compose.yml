@@ -9,7 +9,7 @@
 #   mailhog     — SMTP catcher for dev (UI → http://localhost:8025)
 #   web         — Django API via Gunicorn (http://localhost:8000)
 #   celery      — Celery worker (background tasks)
-#   profile reminder scheduling — host cron enqueues through the Celery container
+#   celery-beat — Celery Beat (periodic task scheduler)
 # ─────────────────────────────────────────────────────────────────────────────
 
 services:
@@ -71,6 +71,24 @@ services:
     volumes:
       - sqlite_data:/app/data
       - media_files:/app/media
+    depends_on:
+      redis:
+        condition: service_healthy
+      web:
+        condition: service_started
+
+  # ── Celery Beat ────────────────────────────────────────────────────────────
+  celery-beat:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    container_name: cloudsync_celery_beat
+    command: celery-beat
+    restart: unless-stopped
+    env_file:
+      - .env.docker
+    volumes:
+      - sqlite_data:/app/data
     depends_on:
       redis:
         condition: service_healthy
