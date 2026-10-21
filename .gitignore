@@ -1,4 +1,5 @@
 .env
+.env.docker
 .venv/
 .env.example
 __pycache__/
@@ -6,3 +7,6 @@ __pycache__/
 media/
 db.sqlite3*
 mailhog
+celerybeat-schedule
+celerybeat.pid
+staticfiles/

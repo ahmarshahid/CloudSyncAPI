@@ -23,3 +23,23 @@ class IsPaidUser(BasePermission):
     def has_permission(self, request, view):
         user = request.user
         return bool(user and user.is_authenticated and user_is_paid(user))
+
+
+def user_has_google_drive(user):
+    """True for an authenticated user who has connected their Google Drive."""
+    return bool(
+        user
+        and user.is_authenticated
+        and hasattr(user, 'google_drive')
+        and user.google_drive is not None
+    )
+
+
+class HasGoogleDriveConnected(BasePermission):
+    """Allows access only to users who have an active Google Drive connection."""
+
+    message = Messages.DRIVE_NOT_CONNECTED
+
+    def has_permission(self, request, view):
+        return user_has_google_drive(request.user)
+

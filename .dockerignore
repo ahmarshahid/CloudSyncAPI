@@ -1,0 +1,39 @@
+# Python artefacts
+__pycache__/
+*.py[cod]
+*.pyo
+*.pyd
+.Python
+
+# Virtual environment
+.venv/
+venv/
+env/
+
+# Django local files
+db.sqlite3
+db.sqlite3.bak
+*.bak
+celerybeat-schedule
+celerybeat.pid
+media/
+staticfiles/
+
+# Docker / secrets
+.env
+.env.docker
+.env.example
+
+# Git
+.git/
+.gitignore
+
+# IDE / OS
+.vscode/
+.idea/
+*.DS_Store
+Thumbs.db
+
+# Docs / tests (not needed inside the image)
+*.md
+README*

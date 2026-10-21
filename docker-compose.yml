@@ -1,0 +1,104 @@
+# ─────────────────────────────────────────────────────────────────────────────
+# CloudSync API — Docker Compose
+#
+# One command to start everything:
+#   docker compose up --build
+#
+# Services:
+#   redis       — Celery broker, result backend, and Django cache
+#   mailhog     — SMTP catcher for dev (UI → http://localhost:8025)
+#   web         — Django API via Gunicorn (http://localhost:8000)
+#   celery      — Celery worker (background tasks)
+#   celery-beat — Celery Beat (periodic task scheduler)
+# ─────────────────────────────────────────────────────────────────────────────
+
+services:
+
+  # ── Redis ──────────────────────────────────────────────────────────────────
+  redis:
+    image: redis:7-alpine
+    container_name: cloudsync_redis
+    restart: unless-stopped
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+    volumes:
+      - redis_data:/data
+
+  # ── MailHog ────────────────────────────────────────────────────────────────
+  mailhog:
+    image: mailhog/mailhog:latest
+    container_name: cloudsync_mailhog
+    restart: unless-stopped
+    ports:
+      - "1025:1025"   # SMTP — Django sends mail here
+      - "8025:8025"   # Web UI — open http://localhost:8025 to read emails
+
+  # ── Django / Gunicorn ──────────────────────────────────────────────────────
+  web:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    container_name: cloudsync_web
+    command: web
+    restart: unless-stopped
+    env_file:
+      - .env.docker
+    ports:
+      - "8000:8000"
+    volumes:
+      - sqlite_data:/app/data                # persist DB across restarts
+      - media_files:/app/media               # uploaded avatars / files
+      - static_files:/app/staticfiles        # collected static assets
+    depends_on:
+      redis:
+        condition: service_healthy
+      mailhog:
+        condition: service_started
+
+  # ── Celery Worker ──────────────────────────────────────────────────────────
+  celery:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    container_name: cloudsync_celery
+    command: celery
+    restart: unless-stopped
+    env_file:
+      - .env.docker
+    volumes:
+      - sqlite_data:/app/data
+      - media_files:/app/media
+    depends_on:
+      redis:
+        condition: service_healthy
+      web:
+        condition: service_started
+
+  # ── Celery Beat ────────────────────────────────────────────────────────────
+  celery-beat:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    container_name: cloudsync_celery_beat
+    command: celery-beat
+    restart: unless-stopped
+    env_file:
+      - .env.docker
+    volumes:
+      - sqlite_data:/app/data
+    depends_on:
+      redis:
+        condition: service_healthy
+      web:
+        condition: service_started
+
+
+# ── Named Volumes ─────────────────────────────────────────────────────────────
+volumes:
+  redis_data:
+  sqlite_data:
+  media_files:
+  static_files:
